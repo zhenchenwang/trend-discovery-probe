@@ -13,7 +13,7 @@ on:
         default: '60'
   push:
     paths:
-      - 'tests/live/tiktok_e2e_probe.py'
+      - 'tests/live/tiktok_e2e_probe_v2.py'
       - '.github/workflows/e2e_probe.yml'
 
 permissions:
@@ -38,10 +38,8 @@ jobs:
         run: |
           python -m pip install playwright
           python -m playwright install --with-deps chromium
-      - name: Verify ffprobe
-        run: ffprobe -version | head -1
-      - name: Run E2E
-        run: python tests/live/tiktok_e2e_probe.py
+      - name: Run E2E v2
+        run: python tests/live/tiktok_e2e_probe_v2.py
       - name: Print summary
         if: always()
         run: cat e2e_artifacts/e2e_summary.json 2>/dev/null || true
