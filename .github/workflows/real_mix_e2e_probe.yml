@@ -14,6 +14,9 @@ on:
   push:
     paths:
       - 'tests/live/real_mix_e2e_probe.py'
+      - 'tests/live/real_mix_e2e_probe_v2.py'
+      - 'tests/live/tiktok_e2e_probe_v2.py'
+      - 'tests/live/youtube_comments_probe.py'
       - '.github/workflows/real_mix_e2e_probe.yml'
 
 permissions:
@@ -26,7 +29,7 @@ jobs:
     env:
       PROBE_TAG: ${{ github.event.inputs.tag || '机器人' }}
       PROBE_LIMIT: ${{ github.event.inputs.limit || '55' }}
-      PROBE_OUT: artifacts/real_mix_e2e
+      PROBE_ROOT: artifacts/real_mix_crosssource
       PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4
@@ -39,18 +42,18 @@ jobs:
           sudo apt-get install -y -qq ffmpeg
           python -m pip install 'playwright>=1.50' 'edge-tts>=7.2,<8'
           python -m playwright install --with-deps chromium
-      - name: Run real Mix E2E
-        run: python tests/live/real_mix_e2e_probe.py
+      - name: Run real cross-source Mix E2E
+        run: python tests/live/real_mix_e2e_probe_v2.py
       - name: Print summary
         if: always()
-        run: cat artifacts/real_mix_e2e/summary.json 2>/dev/null || true
+        run: cat artifacts/real_mix_crosssource/summary.json 2>/dev/null || true
       - name: Upload real Mix evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: real-mix-e2e-${{ github.run_id }}
           path: |
-            artifacts/real_mix_e2e/summary.json
-            artifacts/real_mix_e2e/real_mix.mp4
-            artifacts/real_mix_e2e/comment.mp3
+            artifacts/real_mix_crosssource/summary.json
+            artifacts/real_mix_crosssource/real_mix.mp4
+            artifacts/real_mix_crosssource/comment.mp3
           retention-days: 7
