@@ -64,3 +64,5 @@ jobs:
           path: probe_artifacts/
           if-no-files-found: warn
           retention-days: 7
+
+# diagnostic workflow
