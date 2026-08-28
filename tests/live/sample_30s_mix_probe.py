@@ -38,18 +38,18 @@ def cjk_count(text: str) -> int:
     return len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text or ""))
 
 
-def clean_context(text: str, limit: int = 30) -> str:
+def clean_context(text: str, limit: int = 22) -> str:
     raw = re.sub(r"https?://\S+", "", text or "")
     raw = re.sub(r"[#＃][^\s#＃]+", "", raw)
     raw = re.sub(r"\s+", " ", raw).strip(" ，,。.!！?？;；:-")
-    # The public sample must sound natural in Chinese. If the source caption is
-    # Japanese/English/hashtag-only, use a conservative topic-level description
-    # instead of making up specific unseen actions.
+    # Keep the public sample conservative and cheap: when the source caption is
+    # Japanese/English/hashtag-only, do not hallucinate a specific action. The
+    # production path can replace this fallback with Video Brain's visual summary.
     if cjk_count(raw) < 4:
-        return f"这段视频记录了{TAG}的一个日常瞬间"
+        return f"{TAG}日常"
     if len(raw) > limit:
         raw = raw[:limit].rstrip(" ，,。.!！?？;；:-")
-    return raw or f"这段视频记录了{TAG}的一个日常瞬间"
+    return raw or f"{TAG}日常"
 
 
 def choose_youtube_comments(yt: ModuleType, count: int = 2) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -79,19 +79,23 @@ def choose_youtube_comments(yt: ModuleType, count: int = 2) -> tuple[list[dict[s
         })
         for comment in comments:
             text = re.sub(r"\s+", " ", str(comment.get("text") or "")).strip()
-            if 4 <= len(text) <= 82:
+            if 4 <= len(text) <= 72:
                 pool.append((row, comment))
         chinese = [pair for pair in pool if cjk_count(str(pair[1].get("text") or "")) >= 4]
-        if len(chinese) >= count:
+        if len(chinese) >= max(6, count):
             break
 
     if not pool:
         raise RuntimeError(f"YouTube comment pool was empty; attempts={attempts}")
+
+    # For a short Mix, prefer comments that are actually speakable in a few
+    # seconds. This is a deterministic resource/time decision, not an LLM call.
     pool.sort(
         key=lambda pair: (
             cjk_count(str(pair[1].get("text") or "")) >= 4,
-            cjk_count(str(pair[1].get("text") or "")),
-            -abs(len(str(pair[1].get("text") or "")) - 24),
+            6 <= cjk_count(str(pair[1].get("text") or "")) <= 16,
+            -abs(cjk_count(str(pair[1].get("text") or "")) - 11),
+            -abs(len(str(pair[1].get("text") or "")) - 18),
         ),
         reverse=True,
     )
@@ -140,10 +144,9 @@ def synthesize_tts(mix: ModuleType, *, index: int, context: str, comment: dict[s
     )
     info = mix.ffprobe(path)
     duration = float(info["format"]["duration"])
-    # A TTS beat may hold its final frame briefly; it is never cut shorter than the
-    # speech. Five seconds minimum also prevents a short final content clip from
-    # forcing the total below the requested 30-second floor.
-    slot = min(9.5, max(5.0, duration + 0.25))
+    # Duration is a floor everywhere: the TTS slot is derived from the *actual*
+    # synthesized file and is never capped below the speech length.
+    slot = max(3.0, duration + 0.25)
     return path, {
         "voice": "zh-CN-XiaoxiaoNeural",
         "context": context,
@@ -158,10 +161,10 @@ def synthesize_tts(mix: ModuleType, *, index: int, context: str, comment: dict[s
 
 def main() -> int:
     report: dict[str, Any] = {
-        "probe": "sample-30s-mix-v2",
+        "probe": "sample-30s-mix-v3",
         "theme": TAG,
         "requested_minimum_seconds": MINIMUM,
-        "policy": "minimum-duration floor; complete source clips; video context then direct comments",
+        "policy": "minimum-duration floor; complete source clips; complete direct-comment TTS beats",
         "stages": {},
     }
     try:
@@ -215,8 +218,6 @@ def main() -> int:
 
         source_infos = [mix.ffprobe(path) for path in paths]
         source_durations = [float(info["format"]["duration"]) for info in source_infos]
-        # Never ask FFmpeg for more video than the real source contains. This was
-        # the exact failure mode found by sample-v1 with two 5-6 second cat clips.
         clip_durations = [max(2.0, min(9.5, value - 0.18)) for value in source_durations]
 
         segment_paths = [
@@ -284,6 +285,7 @@ def main() -> int:
             "three_real_tiktok_mp4s": len(paths) == 3 and all(path.stat().st_size > 10_000 for path in paths),
             "two_real_youtube_comments": len(comments) == 2 and all(item.get("id") and item.get("text") for item in comments),
             "direct_comments_no_wrapper": all("网友" not in meta["text"] and "有人说" not in meta["text"] for meta in (tts1_meta, tts2_meta)),
+            "tts_beats_complete": aligned[1] >= tts1_meta["duration"] and aligned[3] >= tts2_meta["duration"],
             "real_audio_inspection": len(audio) == 3 and all("has_audio_stream" in item for item in audio),
             "tts_generated": tts1.stat().st_size > 1000 and tts2.stat().st_size > 1000,
             "h264": video.get("codec_name") == "h264",
