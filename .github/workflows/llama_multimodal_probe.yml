@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euxo pipefail
           "$SERVER" \
-            -hf ggml-org/SmolVLM2-256M-Video-Instruct-GGUF \
+            -hf ggml-org/SmolVLM2-256M-Video-Instruct-GGUF:Q4_K_M \
             --alias "$PROBE_VLM_MODEL" \
             --host 127.0.0.1 \
             --port 8080 \
