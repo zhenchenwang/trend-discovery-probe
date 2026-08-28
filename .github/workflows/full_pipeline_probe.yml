@@ -1,0 +1,122 @@
+name: Full TikTok to Video Brain pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: TikTok hashtag without #
+        required: false
+        default: 机器人
+      limit:
+        description: Candidate limit
+        required: false
+        default: '40'
+  push:
+    paths:
+      - 'tests/live/full_pipeline_probe.py'
+      - 'tests/live/tiktok_e2e_probe_v2.py'
+      - '.github/workflows/full_pipeline_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  full-pipeline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      LLAMA_TAG: b10621
+      PROBE_TAG: ${{ github.event.inputs.tag || '机器人' }}
+      PROBE_LIMIT: ${{ github.event.inputs.limit || '40' }}
+      PROBE_OUT: full_pipeline_artifacts
+      PROBE_VLM_URL: http://127.0.0.1:8080/v1
+      PROBE_VLM_MODEL: trend-video-brain
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install browser and video dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --disable-pip-version-check playwright
+          python -m playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 2
+
+      - name: Download llama.cpp CPU runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p .runtime/llama
+          curl -fL --retry 4 --retry-delay 2 \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/llama-${LLAMA_TAG}-bin-ubuntu-x64.tar.gz" \
+            -o .runtime/llama.tar.gz
+          tar -xzf .runtime/llama.tar.gz -C .runtime/llama
+          SERVER="$(find .runtime/llama -type f -name llama-server | head -n 1)"
+          test -n "$SERVER"
+          chmod +x "$SERVER"
+          echo "SERVER=$SERVER" >> "$GITHUB_ENV"
+          "$SERVER" --version
+
+      - name: Start tiny local multimodal model
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "$SERVER" \
+            -hf ggml-org/SmolVLM2-256M-Video-Instruct-GGUF:Q8_0 \
+            --alias "$PROBE_VLM_MODEL" \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --ctx-size 8192 \
+            --image-max-tokens 256 \
+            --no-webui \
+            > llama-server.log 2>&1 &
+          echo $! > llama-server.pid
+
+          ready=0
+          for i in $(seq 1 180); do
+            code="$(curl -sS -o health.json -w '%{http_code}' http://127.0.0.1:8080/health || true)"
+            if [ "$code" = "200" ]; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$(cat llama-server.pid)" 2>/dev/null; then
+              echo "llama-server exited early"
+              tail -n 200 llama-server.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+          test "$ready" = "1"
+          cat health.json
+
+      - name: Run full live pipeline
+        run: python tests/live/full_pipeline_probe.py
+
+      - name: Print pipeline summary
+        if: always()
+        run: |
+          echo '===== FULL PIPELINE SUMMARY ====='
+          cat full_pipeline_artifacts/full_pipeline_summary.json 2>/dev/null || true
+          echo '===== LLAMA SERVER TAIL ====='
+          tail -n 160 llama-server.log 2>/dev/null || true
+
+      - name: Upload full pipeline diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-pipeline-${{ github.run_id }}
+          path: |
+            full_pipeline_artifacts/full_pipeline_summary.json
+            full_pipeline_artifacts/probe.sqlite3
+            full_pipeline_artifacts/frames/
+            full_pipeline_artifacts/tiktok/media/
+            llama-server.log
+            health.json
+          if-no-files-found: warn
+          retention-days: 7
