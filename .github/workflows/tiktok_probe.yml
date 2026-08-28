@@ -1,0 +1,66 @@
+name: TikTok live probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: TikTok search query
+        required: false
+        default: humanoid robot
+      limit:
+        description: Maximum video URLs to collect
+        required: false
+        default: '40'
+  push:
+    paths:
+      - 'tests/live/tiktok_probe.py'
+      - '.github/workflows/tiktok_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PROBE_QUERY: ${{ github.event.inputs.query || 'humanoid robot' }}
+      PROBE_LIMIT: ${{ github.event.inputs.limit || '40' }}
+      PROBE_HEADLESS: '1'
+      PROBE_OUT: probe_artifacts
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install probe dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright yt-dlp
+          python -m playwright install --with-deps chromium
+
+      - name: Run TikTok live probe
+        run: python tests/live/tiktok_probe.py
+
+      - name: Print result
+        if: always()
+        run: |
+          echo '--- summary.json ---'
+          cat probe_artifacts/summary.json 2>/dev/null || true
+          echo
+          echo '--- probe_result.json ---'
+          cat probe_artifacts/probe_result.json 2>/dev/null || true
+
+      - name: Upload diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-live-probe-${{ github.run_id }}
+          path: probe_artifacts/
+          if-no-files-found: warn
+          retention-days: 7
