@@ -1,0 +1,42 @@
+name: YouTube comments probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: Search query
+        required: false
+        default: 机器人 shorts
+  push:
+    paths:
+      - 'tests/live/youtube_comments_probe.py'
+      - '.github/workflows/youtube_comments_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  comments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      PROBE_QUERY: ${{ github.event.inputs.query || '机器人 shorts' }}
+      PROBE_OUT: artifacts/youtube_comments
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run plain HTTP comments probe
+        run: python tests/live/youtube_comments_probe.py
+      - name: Print summary
+        if: always()
+        run: cat artifacts/youtube_comments/summary.json 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-comments-${{ github.run_id }}
+          path: artifacts/youtube_comments/summary.json
+          retention-days: 7
