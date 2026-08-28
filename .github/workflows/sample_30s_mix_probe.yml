@@ -1,0 +1,57 @@
+name: 30s Cat Mix Sample
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: TikTok hashtag without #
+        required: false
+        default: 猫咪
+      limit:
+        description: Candidate discovery limit
+        required: false
+        default: '70'
+  push:
+    paths:
+      - 'tests/live/sample_30s_mix_probe.py'
+      - '.github/workflows/sample_30s_mix_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  sample-30s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    env:
+      PROBE_TAG: ${{ github.event.inputs.tag || '猫咪' }}
+      PROBE_LIMIT: ${{ github.event.inputs.limit || '70' }}
+      PROBE_MINIMUM: '30'
+      PROBE_ROOT: artifacts/sample_30s_mix
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install media and browser dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install 'playwright>=1.50' 'edge-tts>=7.2,<8'
+          python -m playwright install --with-deps chromium
+      - name: Build real 30s sample
+        run: python tests/live/sample_30s_mix_probe.py
+      - name: Print summary
+        if: always()
+        run: cat artifacts/sample_30s_mix/summary.json 2>/dev/null || true
+      - name: Upload sample
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample-30s-cat-${{ github.run_id }}
+          path: |
+            artifacts/sample_30s_mix/summary.json
+            artifacts/sample_30s_mix/sample_30s_mix.mp4
+            artifacts/sample_30s_mix/comment.mp3
+          retention-days: 7
