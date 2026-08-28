@@ -53,5 +53,6 @@ jobs:
           path: |
             artifacts/sample_30s_mix/summary.json
             artifacts/sample_30s_mix/sample_30s_mix.mp4
-            artifacts/sample_30s_mix/comment.mp3
+            artifacts/sample_30s_mix/comment_1.mp3
+            artifacts/sample_30s_mix/comment_2.mp3
           retention-days: 7
