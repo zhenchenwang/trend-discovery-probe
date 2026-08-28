@@ -1,0 +1,85 @@
+name: llama.cpp multimodal API probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tests/live/llama_multimodal_probe.py"
+      - ".github/workflows/llama_multimodal_probe.yml"
+
+jobs:
+  multimodal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      LLAMA_TAG: b10621
+      PROBE_VLM_URL: http://127.0.0.1:8080/v1
+      PROBE_VLM_MODEL: trend-video-brain
+      PROBE_OUT: llama_multimodal_artifacts
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download llama.cpp CPU runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p .runtime/llama
+          curl -fL --retry 4 --retry-delay 2 \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/llama-${LLAMA_TAG}-bin-ubuntu-x64.tar.gz" \
+            -o .runtime/llama.tar.gz
+          tar -xzf .runtime/llama.tar.gz -C .runtime/llama
+          SERVER="$(find .runtime/llama -type f -name llama-server | head -n 1)"
+          test -n "$SERVER"
+          chmod +x "$SERVER"
+          echo "SERVER=$SERVER" >> "$GITHUB_ENV"
+          "$SERVER" --version
+
+      - name: Start tiny vision model
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "$SERVER" \
+            -hf ggml-org/SmolVLM2-256M-Video-Instruct-GGUF \
+            --alias "$PROBE_VLM_MODEL" \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --ctx-size 4096 \
+            --image-max-tokens 256 \
+            --no-webui \
+            > llama-server.log 2>&1 &
+          echo $! > llama-server.pid
+
+          ready=0
+          for i in $(seq 1 120); do
+            code="$(curl -sS -o health.json -w '%{http_code}' http://127.0.0.1:8080/health || true)"
+            if [ "$code" = "200" ]; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$(cat llama-server.pid)" 2>/dev/null; then
+              echo "llama-server exited early"
+              tail -n 200 llama-server.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+          test "$ready" = "1"
+          cat health.json
+
+      - name: Probe OpenAI-compatible image_url request
+        run: python tests/live/llama_multimodal_probe.py
+
+      - name: Print server tail
+        if: always()
+        run: tail -n 160 llama-server.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llama-multimodal-${{ github.run_id }}
+          path: |
+            llama_multimodal_artifacts/
+            llama-server.log
+            health.json
+          if-no-files-found: warn
+          retention-days: 7
