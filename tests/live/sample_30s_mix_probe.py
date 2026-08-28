@@ -42,9 +42,8 @@ def clean_context(text: str, limit: int = 22) -> str:
     raw = re.sub(r"https?://\S+", "", text or "")
     raw = re.sub(r"[#＃][^\s#＃]+", "", raw)
     raw = re.sub(r"\s+", " ", raw).strip(" ，,。.!！?？;；:-")
-    # Keep the public sample conservative and cheap: when the source caption is
-    # Japanese/English/hashtag-only, do not hallucinate a specific action. The
-    # production path can replace this fallback with Video Brain's visual summary.
+    # Cheap metadata fallback. Production can replace this with Video Brain output,
+    # but this public sample deliberately avoids a VLM just to describe a cat clip.
     if cjk_count(raw) < 4:
         return f"{TAG}日常"
     if len(raw) > limit:
@@ -82,14 +81,11 @@ def choose_youtube_comments(yt: ModuleType, count: int = 2) -> tuple[list[dict[s
             if 4 <= len(text) <= 72:
                 pool.append((row, comment))
         chinese = [pair for pair in pool if cjk_count(str(pair[1].get("text") or "")) >= 4]
-        if len(chinese) >= max(6, count):
+        if len(chinese) >= max(4, count):
             break
 
     if not pool:
         raise RuntimeError(f"YouTube comment pool was empty; attempts={attempts}")
-
-    # For a short Mix, prefer comments that are actually speakable in a few
-    # seconds. This is a deterministic resource/time decision, not an LLM call.
     pool.sort(
         key=lambda pair: (
             cjk_count(str(pair[1].get("text") or "")) >= 4,
@@ -144,8 +140,8 @@ def synthesize_tts(mix: ModuleType, *, index: int, context: str, comment: dict[s
     )
     info = mix.ffprobe(path)
     duration = float(info["format"]["duration"])
-    # Duration is a floor everywhere: the TTS slot is derived from the *actual*
-    # synthesized file and is never capped below the speech length.
+    # Never cap the slot below actual speech. Minimum-duration policy applies to
+    # narration/comment beats just as much as to source-video beats.
     slot = max(3.0, duration + 0.25)
     return path, {
         "voice": "zh-CN-XiaoxiaoNeural",
@@ -161,10 +157,10 @@ def synthesize_tts(mix: ModuleType, *, index: int, context: str, comment: dict[s
 
 def main() -> int:
     report: dict[str, Any] = {
-        "probe": "sample-30s-mix-v3",
+        "probe": "sample-30s-mix-v4",
         "theme": TAG,
         "requested_minimum_seconds": MINIMUM,
-        "policy": "minimum-duration floor; complete source clips; complete direct-comment TTS beats",
+        "policy": "30s floor; uniform natural clip cap; only add another full TTS beat if needed",
         "stages": {},
     }
     try:
@@ -192,6 +188,20 @@ def main() -> int:
         if not all(path.exists() and path.stat().st_size > 10_000 for path in paths):
             raise RuntimeError(f"downloaded TikTok paths missing: {paths}")
 
+        os.environ["PROBE_OUT"] = str(ROOT)
+        mix = load_module("sample_30s_helpers", here / "real_mix_e2e_probe.py")
+        audio = [mix.audio_signal(path) for path in paths]
+        source_infos = [mix.ffprobe(path) for path in paths]
+        source_durations = [float(info["format"]["duration"]) for info in source_infos]
+        # Every selected visual follows the same 8s content cap. We never shrink the
+        # *last* clip to the leftover clock remainder.
+        clip_durations = [max(2.0, min(8.0, value - 0.18)) for value in source_durations]
+        aligned_clips = [mix.frame_duration(value) for value in clip_durations]
+        report["stages"]["audio"] = [
+            {"video_id": selected[index]["id"], "path": str(path), **audio[index]}
+            for index, path in enumerate(paths)
+        ]
+
         yt_out = ROOT / "youtube"
         os.environ["PROBE_OUT"] = str(yt_out)
         os.environ["PROBE_QUERY"] = f"{TAG} shorts 中文"
@@ -203,49 +213,44 @@ def main() -> int:
             **comment_diag,
         }
 
-        os.environ["PROBE_OUT"] = str(ROOT)
-        mix = load_module("sample_30s_helpers", here / "real_mix_e2e_probe.py")
-        audio = [mix.audio_signal(path) for path in paths]
-        report["stages"]["audio"] = [
-            {"video_id": selected[index]["id"], "path": str(path), **audio[index]}
-            for index, path in enumerate(paths)
-        ]
-
         contexts = [clean_context(str(selected[i].get("description") or "")) for i in range(2)]
-        tts1, tts1_meta = synthesize_tts(mix, index=1, context=contexts[0], comment=comments[0])
-        tts2, tts2_meta = synthesize_tts(mix, index=2, context=contexts[1], comment=comments[1])
-        report["stages"]["tts"] = [tts1_meta, tts2_meta]
+        tts_entries: list[tuple[Path, dict[str, Any]]] = []
+        tts_entries.append(synthesize_tts(mix, index=1, context=contexts[0], comment=comments[0]))
+        first_tts_aligned = mix.frame_duration(tts_entries[0][1]["slot"])
+        projected = sum(aligned_clips) + first_tts_aligned
+        if projected < MINIMUM:
+            # Add a second complete comment beat, rather than stretching/cutting a
+            # source clip or truncating speech to land on exactly 30.000 seconds.
+            tts_entries.append(synthesize_tts(mix, index=2, context=contexts[1], comment=comments[1]))
+        report["stages"]["tts"] = [meta for _, meta in tts_entries]
 
-        source_infos = [mix.ffprobe(path) for path in paths]
-        source_durations = [float(info["format"]["duration"]) for info in source_infos]
-        clip_durations = [max(2.0, min(9.5, value - 0.18)) for value in source_durations]
+        segment_specs: list[tuple[str, int | None]] = [("clip", 0), ("tts", 0), ("clip", 1)]
+        if len(tts_entries) > 1:
+            segment_specs.append(("tts", 1))
+        segment_specs.append(("clip", 2))
 
-        segment_paths = [
-            ROOT / "seg1.mp4", ROOT / "seg_tts1.mp4",
-            ROOT / "seg2.mp4", ROOT / "seg_tts2.mp4", ROOT / "seg3.mp4",
-        ]
-        aligned = [
-            mix.make_segment(
-                paths[0], segment_paths[0], start=0.08, duration=clip_durations[0],
-                keep_audio=bool(audio[0].get("signal_detected")),
-            ),
-            mix.make_tts_segment(
-                paths[0], segment_paths[1], at=max(0.08, clip_durations[0] - 0.08),
-                tts=tts1, duration=tts1_meta["slot"],
-            ),
-            mix.make_segment(
-                paths[1], segment_paths[2], start=0.08, duration=clip_durations[1],
-                keep_audio=bool(audio[1].get("signal_detected")),
-            ),
-            mix.make_tts_segment(
-                paths[1], segment_paths[3], at=max(0.08, clip_durations[1] - 0.08),
-                tts=tts2, duration=tts2_meta["slot"],
-            ),
-            mix.make_segment(
-                paths[2], segment_paths[4], start=0.08, duration=clip_durations[2],
-                keep_audio=bool(audio[2].get("signal_detected")),
-            ),
-        ]
+        segment_paths = [ROOT / f"seg_{index + 1}.mp4" for index in range(len(segment_specs))]
+        aligned: list[float] = []
+        for out, (kind, index) in zip(segment_paths, segment_specs):
+            assert index is not None
+            if kind == "clip":
+                aligned.append(
+                    mix.make_segment(
+                        paths[index], out, start=0.08, duration=clip_durations[index],
+                        keep_audio=bool(audio[index].get("signal_detected")),
+                    )
+                )
+            else:
+                tts_path, tts_meta = tts_entries[index]
+                background_index = min(index, len(paths) - 1)
+                aligned.append(
+                    mix.make_tts_segment(
+                        paths[background_index], out,
+                        at=max(0.08, clip_durations[background_index] - 0.08),
+                        tts=tts_path, duration=tts_meta["slot"],
+                    )
+                )
+
         expected_duration = sum(aligned)
         if expected_duration < MINIMUM:
             raise RuntimeError(
@@ -279,15 +284,20 @@ def main() -> int:
         frames = int(video.get("nb_read_frames") or video.get("nb_frames") or 0)
         duration = float(final["format"]["duration"])
         expected_frames = round(expected_duration * FPS)
+        tts_segment_durations = [
+            aligned[pos]
+            for pos, (kind, _) in enumerate(segment_specs)
+            if kind == "tts"
+        ]
         assertions = {
             "different_theme": TAG != "机器人",
             "real_tiktok_candidates": int(tik_report.get("candidate_count") or 0) >= 20,
             "three_real_tiktok_mp4s": len(paths) == 3 and all(path.stat().st_size > 10_000 for path in paths),
-            "two_real_youtube_comments": len(comments) == 2 and all(item.get("id") and item.get("text") for item in comments),
-            "direct_comments_no_wrapper": all("网友" not in meta["text"] and "有人说" not in meta["text"] for meta in (tts1_meta, tts2_meta)),
-            "tts_beats_complete": aligned[1] >= tts1_meta["duration"] and aligned[3] >= tts2_meta["duration"],
+            "real_youtube_comments": len(comments) >= 2 and all(item.get("id") and item.get("text") for item in comments),
+            "direct_comments_no_wrapper": all("网友" not in meta["text"] and "有人说" not in meta["text"] for _, meta in tts_entries),
+            "tts_beats_complete": all(rendered >= meta["duration"] for rendered, (_, meta) in zip(tts_segment_durations, tts_entries)),
             "real_audio_inspection": len(audio) == 3 and all("has_audio_stream" in item for item in audio),
-            "tts_generated": tts1.stat().st_size > 1000 and tts2.stat().st_size > 1000,
+            "tts_generated": all(path.stat().st_size > 1000 for path, _ in tts_entries),
             "h264": video.get("codec_name") == "h264",
             "aac": audio_stream.get("codec_name") == "aac",
             "portrait": int(video.get("width") or 0) == W and int(video.get("height") or 0) == H,
@@ -295,14 +305,16 @@ def main() -> int:
             "frame_count": abs(frames - expected_frames) <= 1,
             "duration_matches_complete_segments": abs(duration - expected_duration) <= 0.16,
             "minimum_30s_floor": duration >= MINIMUM - 0.02,
-            "last_segment_complete": abs(aligned[-1] - mix.frame_duration(clip_durations[-1])) <= 0.001,
+            "last_segment_complete": abs(aligned[-1] - aligned_clips[-1]) <= 0.001,
         }
         report["stages"]["render"] = {
             "output": str(output),
             "bytes": output.stat().st_size,
             "requested_minimum_seconds": MINIMUM,
             "source_durations": source_durations,
+            "uniform_clip_cap_seconds": 8.0,
             "clip_durations": clip_durations,
+            "segment_order": [kind for kind, _ in segment_specs],
             "aligned_segment_durations": aligned,
             "expected_duration": expected_duration,
             "duration": duration,
