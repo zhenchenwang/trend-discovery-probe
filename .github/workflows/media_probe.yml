@@ -44,3 +44,5 @@ jobs:
           name: tiktok-media-${{ github.run_id }}
           path: media_artifacts/
           retention-days: 7
+
+# standalone development probe
