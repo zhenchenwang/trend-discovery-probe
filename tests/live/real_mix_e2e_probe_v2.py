@@ -14,6 +14,7 @@ ROOT = Path(os.getenv("PROBE_ROOT", "artifacts/real_mix_crosssource"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TAG = os.getenv("PROBE_TAG", "机器人").strip().lstrip("#") or "机器人"
 LIMIT = max(30, min(120, int(os.getenv("PROBE_LIMIT", "55"))))
+MINIMUM_DURATION = max(8.0, float(os.getenv("PROBE_MIN_DURATION", "12")))
 FPS = 24
 W, H = 360, 640
 
@@ -35,6 +36,12 @@ def rate(value: str | None) -> float:
 
 def cjk_count(text: str) -> int:
     return len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text or ""))
+
+
+def clean_context(text: str, limit: int = 34) -> str:
+    value = re.sub(r"(?:\s*#[^\s#]+)+\s*$", "", str(text or "")).strip()
+    value = re.sub(r"\s+", " ", value).strip(" ，,。.!！?？")
+    return value[:limit].rstrip(" ，,。.!！?？")
 
 
 def choose_youtube_comment(yt: ModuleType) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -70,8 +77,6 @@ def choose_youtube_comment(yt: ModuleType) -> tuple[dict[str, Any], dict[str, An
             text = str(comment.get("text") or "").strip()
             if text:
                 pool.append((row, comment))
-        # Stop early once a Chinese comment exists. Otherwise collect a few real
-        # public comments and use the best fallback instead of burning requests.
         if any(cjk_count(str(comment.get("text") or "")) >= 2 for _, comment in pool):
             break
         if len(pool) >= 6:
@@ -101,9 +106,10 @@ def choose_youtube_comment(yt: ModuleType) -> tuple[dict[str, Any], dict[str, An
 
 def main() -> int:
     report: dict[str, Any] = {
-        "probe": "real-tiktok-footage-youtube-comment-mix-v2",
+        "probe": "real-tiktok-footage-youtube-comment-mix-v3",
         "tag": TAG,
-        "policy": "TikTok footage + YouTube plain-HTTP topic comment + Chinese neural TTS + frame-aligned stream-copy concat",
+        "policy": "minimum duration floor + complete last clip + video context then direct comment",
+        "requested_minimum_seconds": MINIMUM_DURATION,
         "stages": {},
     }
     try:
@@ -151,7 +157,10 @@ def main() -> int:
             for index, path in enumerate(paths)
         ]
 
-        tts_text = mix.safe_tts_text(str(comment.get("text") or ""))
+        context = clean_context(str(selected[0].get("description") or ""))
+        direct_comment = re.sub(r"\s+", " ", str(comment.get("text") or "")).strip()
+        direct_comment = direct_comment[:90].rstrip()
+        tts_text = f"{context}。{direct_comment}" if context else direct_comment
         tts_path = ROOT / "comment.mp3"
         subprocess.run(
             [
@@ -169,12 +178,15 @@ def main() -> int:
         report["stages"]["tts"] = {
             "voice": "zh-CN-XiaoxiaoNeural",
             "text": tts_text,
+            "comment_prefix": "none",
             "bytes": tts_path.stat().st_size,
             "duration": tts_duration,
         }
 
         source_infos = [mix.ffprobe(path) for path in paths]
         source_durations = [float(info["format"]["duration"]) for info in source_infos]
+        # Complete natural test beats. No duration is shortened because only a few
+        # seconds remain before the requested minimum.
         clip_durations = [min(5.0, max(2.5, value - 0.15)) for value in source_durations]
         seg1, seg2, seg3 = ROOT / "seg1.mp4", ROOT / "seg2.mp4", ROOT / "seg3.mp4"
         aligned = [
@@ -194,9 +206,9 @@ def main() -> int:
 
         listing = ROOT / "mix.ffconcat"
         lines = ["ffconcat version 1.0"]
-        for path, duration in zip((seg1, seg2, seg3), aligned):
+        for path, segment_duration in zip((seg1, seg2, seg3), aligned):
             lines.append(f"file '{path.resolve().as_posix()}'")
-            lines.append(f"duration {duration:.9f}")
+            lines.append(f"duration {segment_duration:.9f}")
         listing.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         output = ROOT / "real_mix.mp4"
@@ -225,20 +237,27 @@ def main() -> int:
             "two_real_tiktok_mp4s": len(paths) == 2 and all(path.stat().st_size > 10_000 for path in paths),
             "real_youtube_comment": bool(comment.get("id") and comment.get("text")),
             "real_audio_inspection": len(audio) == 2 and all("has_audio_stream" in item for item in audio),
+            "direct_comment_no_wrapper": "网友评论" not in tts_text and "网友表示" not in tts_text,
             "chinese_tts_generated": tts_path.stat().st_size > 1000,
             "h264": video.get("codec_name") == "h264",
             "aac": audio_stream.get("codec_name") == "aac",
             "portrait": int(video.get("width") or 0) == W and int(video.get("height") or 0) == H,
             "true_24fps": 23.8 <= avg <= 24.2,
             "frame_count": abs(frames - expected_frames) <= 1,
-            "duration": abs(duration - expected_duration) <= 0.16,
+            "duration_matches_complete_segments": abs(duration - expected_duration) <= 0.16,
+            "minimum_duration_floor": duration + 0.02 >= MINIMUM_DURATION,
+            "last_segment_complete": abs(aligned[-1] - clip_durations[1]) <= (1.0 / FPS + 0.02),
         }
         report["stages"]["render"] = {
             "output": str(output),
             "bytes": output.stat().st_size,
+            "requested_minimum_seconds": MINIMUM_DURATION,
             "aligned_segment_durations": aligned,
             "expected_duration": expected_duration,
             "duration": duration,
+            "overrun_seconds": max(0.0, duration - MINIMUM_DURATION),
+            "last_segment_requested": clip_durations[1],
+            "last_segment_rendered": aligned[-1],
             "avg_fps": avg,
             "frames": frames,
             "expected_frames": expected_frames,
