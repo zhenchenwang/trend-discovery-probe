@@ -1,0 +1,38 @@
+name: Lightweight Audio Brain probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tests/live/audio_resource_probe.py'
+      - '.github/workflows/audio_resource_probe.yml'
+
+jobs:
+  audio:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PROBE_TAG: 机器人
+      PROBE_OUT: audio_probe_artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install lightweight dependencies
+        run: |
+          python -m pip install --disable-pip-version-check playwright webrtcvad-wheels
+          python -m playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Run real-video Audio Brain probe
+        run: python tests/live/audio_resource_probe.py
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-probe-${{ github.run_id }}
+          path: |
+            audio_probe_artifacts/audio_probe.json
+            audio_probe_artifacts/tiktok/media/
+          retention-days: 7
