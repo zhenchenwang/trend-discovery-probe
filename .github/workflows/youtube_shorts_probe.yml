@@ -1,0 +1,30 @@
+name: YouTube Shorts low-resource probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tests/live/youtube_shorts_probe.py'
+      - '.github/workflows/youtube_shorts_probe.yml'
+
+jobs:
+  youtube:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      PROBE_QUERY: humanoid robot
+      PROBE_OUT: youtube_probe_artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run pure HTTP discovery and comments probe
+        run: python tests/live/youtube_shorts_probe.py
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-probe-${{ github.run_id }}
+          path: youtube_probe_artifacts/youtube_probe.json
+          retention-days: 7
