@@ -1,0 +1,46 @@
+name: TikTok media probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: Known public TikTok video URL
+        required: false
+        default: https://www.tiktok.com/@newstalkhq/video/7678230444881612063
+  push:
+    paths:
+      - 'tests/live/tiktok_media_probe.py'
+      - '.github/workflows/media_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      PROBE_KNOWN_VIDEO: ${{ github.event.inputs.video || 'https://www.tiktok.com/@newstalkhq/video/7678230444881612063' }}
+      PROBE_OUT: media_artifacts
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Run media probe
+        run: python tests/live/tiktok_media_probe.py
+      - name: Print summary
+        if: always()
+        run: cat media_artifacts/media_summary.json 2>/dev/null || true
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-media-${{ github.run_id }}
+          path: media_artifacts/
+          retention-days: 7
