@@ -1,0 +1,25 @@
+name: YouTube player metadata probe
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tests/live/youtube_player_metadata_probe.py'
+      - '.github/workflows/youtube_player_metadata_probe.yml'
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Probe player metadata over HTTP
+        run: python tests/live/youtube_player_metadata_probe.py
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-player-${{ github.run_id }}
+          path: youtube_player_probe_artifacts/player_metadata.json
+          retention-days: 3
