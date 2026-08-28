@@ -1,0 +1,31 @@
+name: Mix render pipeline probe
+on:
+  push:
+    paths:
+      - 'tests/live/render_pipeline_probe.py'
+      - '.github/workflows/render_pipeline_probe.yml'
+  workflow_dispatch:
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install tiny TTS client
+        run: pip install 'edge-tts>=7.2,<8'
+      - name: Check FFmpeg
+        run: |
+          ffmpeg -version | head -n 2
+          ffprobe -version | head -n 2
+      - name: Run render probe
+        run: python tests/live/render_pipeline_probe.py
+      - name: Upload render evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mix-render-probe-${{ github.run_id }}
+          path: artifacts/render_probe
+          if-no-files-found: warn
