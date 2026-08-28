@@ -86,6 +86,16 @@ def text_value(value: Any) -> str:
     return ""
 
 
+def parse_count(text: str) -> int:
+    value = str(text or "").replace(",", "").strip().casefold()
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([kmb]?)", value)
+    if not match:
+        return 0
+    number = float(match.group(1))
+    mult = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(match.group(2), 1)
+    return int(number * mult)
+
+
 def shorts_from(data: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen = set()
@@ -104,7 +114,6 @@ def shorts_from(data: Any) -> list[dict[str, Any]]:
                         break
         if not video_id or video_id in seen:
             continue
-        # Only accept objects that are clearly Shorts-oriented, not generic watch results.
         raw = json.dumps(obj, ensure_ascii=False)[:12000]
         if "shortsLockupViewModel" not in raw and "reelWatchEndpoint" not in raw:
             continue
@@ -112,7 +121,13 @@ def shorts_from(data: Any) -> list[dict[str, Any]]:
         overlay = obj.get("overlayMetadata") if isinstance(obj.get("overlayMetadata"), dict) else {}
         title = text_value(overlay.get("primaryText")) or text_value(obj.get("headline")) or text_value(obj.get("title"))
         views = text_value(overlay.get("secondaryText")) or text_value(obj.get("viewCountText"))
-        out.append({"video_id": video_id, "title": title, "views_text": views, "url": f"https://www.youtube.com/shorts/{video_id}"})
+        out.append({
+            "video_id": video_id,
+            "title": title,
+            "views_text": views,
+            "view_count": parse_count(views),
+            "url": f"https://www.youtube.com/shorts/{video_id}",
+        })
     return out
 
 
@@ -122,15 +137,25 @@ def api_key_and_version(html: str) -> tuple[str | None, str | None]:
     return (key.group(1) if key else None, version.group(1) if version else None)
 
 
-def continuation_tokens(data: Any) -> list[str]:
-    tokens: list[str] = []
+def continuation_entries(data: Any) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
     for obj in walk(data):
         cmd = obj.get("continuationCommand")
-        if isinstance(cmd, dict) and isinstance(cmd.get("token"), str):
-            token = cmd["token"]
-            if token not in tokens:
-                tokens.append(token)
-    return tokens
+        if not isinstance(cmd, dict) or not isinstance(cmd.get("token"), str):
+            continue
+        token = cmd["token"]
+        if token in seen:
+            continue
+        seen.add(token)
+        blob = json.dumps(obj, ensure_ascii=False)[:1500]
+        entries.append({
+            "token": token,
+            "request": str(cmd.get("request") or ""),
+            "target_id": str(obj.get("targetId") or obj.get("targetId") or ""),
+            "context": blob[:500],
+        })
+    return entries
 
 
 def comments_from(data: Any) -> list[dict[str, Any]]:
@@ -174,13 +199,15 @@ def main() -> int:
         html = body.decode("utf-8", errors="replace")
         initial = balanced_json(html, "ytInitialData")
         shorts = shorts_from(initial or {})
+        shorts.sort(key=lambda x: x.get("view_count", 0), reverse=True)
         key, version = api_key_and_version(html)
         report["stages"]["search"] = {"status": status, "bytes": len(body), "shorts": len(shorts), "api_key": bool(key), "client_version": version}
         report["shorts"] = shorts[:20]
         if not shorts:
             raise RuntimeError("no Shorts found in ytInitialData")
 
-        video_id = shorts[0]["video_id"]
+        selected = shorts[0]
+        video_id = selected["video_id"]
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         status, body, _ = fetch(watch_url)
         watch = body.decode("utf-8", errors="replace")
@@ -188,41 +215,68 @@ def main() -> int:
         key2, version2 = api_key_and_version(watch)
         key = key2 or key
         version = version2 or version or "2.20260801.00.00"
-        tokens = continuation_tokens(initial_watch)
-        report["stages"]["watch"] = {"status": status, "bytes": len(body), "initial_tokens": len(tokens), "api_key": bool(key), "client_version": version}
+        initial_entries = continuation_entries(initial_watch)
+        report["stages"]["watch"] = {
+            "status": status,
+            "bytes": len(body),
+            "initial_tokens": len(initial_entries),
+            "api_key": bool(key),
+            "client_version": version,
+            "continuations": [{k: v for k, v in x.items() if k != "token"} for x in initial_entries],
+            "has_comments_section_text": "comments-section" in watch,
+        }
 
         context = {"client": {"clientName": "WEB", "clientVersion": version, "hl": "en", "gl": "US"}}
         if not key:
             raise RuntimeError("INNERTUBE_API_KEY not found")
         api = f"https://www.youtube.com/youtubei/v1/next?key={urllib.parse.quote(key)}&prettyPrint=false"
+        headers = {"Origin": "https://www.youtube.com", "Referer": watch_url}
 
-        # Asking next with the video id reliably seeds the watch-next/comment section
-        # without running Chromium.
-        s, raw, _ = fetch(api, data={"context": context, "videoId": video_id}, headers={"Origin": "https://www.youtube.com", "Referer": watch_url})
+        s, raw, _ = fetch(api, data={"context": context, "videoId": video_id}, headers=headers)
         next_data = json.loads(raw.decode("utf-8"))
         seeded_comments = comments_from(next_data)
-        next_tokens = continuation_tokens(next_data)
-        report["stages"]["next"] = {"status": s, "bytes": len(raw), "comments": len(seeded_comments), "continuations": len(next_tokens)}
+        next_entries = continuation_entries(next_data)
+        report["stages"]["next"] = {
+            "status": s,
+            "bytes": len(raw),
+            "comments": len(seeded_comments),
+            "continuations": len(next_entries),
+            "has_comments_section": "comments-section" in raw.decode("utf-8", errors="ignore"),
+            "continuation_contexts": [{k: v for k, v in x.items() if k != "token"} for x in next_entries],
+        }
 
         comments = list(seeded_comments)
         used_token = None
-        # Try continuations until one yields comments. This avoids depending on one
-        # brittle path inside ytInitialData.
-        for token in next_tokens[:12] + tokens[:8]:
+        attempts = []
+        for entry in next_entries[:15] + initial_entries[:10]:
+            token = entry["token"]
             try:
-                cs, craw, _ = fetch(api, data={"context": context, "continuation": token}, headers={"Origin": "https://www.youtube.com", "Referer": watch_url})
+                cs, craw, _ = fetch(api, data={"context": context, "continuation": token}, headers=headers)
                 cdata = json.loads(craw.decode("utf-8"))
                 found = comments_from(cdata)
+                attempts.append({
+                    "status": cs,
+                    "bytes": len(craw),
+                    "comments": len(found),
+                    "request": entry.get("request"),
+                    "target_id": entry.get("target_id"),
+                    "has_comment_word": b"comment" in craw.lower(),
+                })
                 if found:
                     comments = found
                     used_token = token
                     report["stages"]["comments"] = {"status": cs, "bytes": len(craw), "comments": len(found)}
                     break
             except Exception as exc:
-                report["errors"].append("continuation:" + repr(exc))
+                attempts.append({"error": repr(exc), "request": entry.get("request"), "target_id": entry.get("target_id")})
+        report["continuation_attempts"] = attempts
         report["comments"] = comments[:30]
-        report["selected"] = shorts[0]
-        report["ok"] = len(shorts) > 0 and len(comments) > 0
+        report["selected"] = selected
+        # Discovery is independently useful and should not be marked broken if a
+        # particular selected video has comments disabled. Keep the comment stage explicit.
+        report["discovery_ok"] = len(shorts) > 0
+        report["comments_ok"] = len(comments) > 0
+        report["ok"] = report["discovery_ok"] and report["comments_ok"]
         report["used_comment_continuation"] = bool(used_token)
     except Exception as exc:
         report["ok"] = False
