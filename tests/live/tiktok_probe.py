@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import html as html_lib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -19,6 +21,16 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 QUERY = os.getenv("PROBE_QUERY", "humanoid robot").strip() or "humanoid robot"
 LIMIT = max(1, int(os.getenv("PROBE_LIMIT", "40")))
 HEADLESS = os.getenv("PROBE_HEADLESS", "1") != "0"
+KNOWN_VIDEO = os.getenv(
+    "PROBE_KNOWN_VIDEO",
+    "https://www.tiktok.com/@eduard.constantin63/video/7605238965226032406",
+).strip()
+KNOWN_USER = os.getenv("PROBE_KNOWN_USER", "eduard.constantin63").strip().lstrip("@")
+KNOWN_TAG = os.getenv("PROBE_KNOWN_TAG", "humanoidrobot").strip().lstrip("#")
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 
 
 def now_iso() -> str:
@@ -27,9 +39,34 @@ def now_iso() -> str:
 
 def dump_json(name: str, data: Any) -> None:
     (OUT_DIR / name).write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+        json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
+
+
+def fetch_bytes(url: str, timeout: int = 30, limit: int = 1_500_000) -> tuple[dict[str, Any], bytes]:
+    meta: dict[str, Any] = {"ok": False, "url": url}
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read(limit)
+            meta.update(
+                ok=True,
+                status=getattr(response, "status", None),
+                final_url=response.geturl(),
+                bytes_read=len(body),
+                content_type=response.headers.get("content-type"),
+            )
+            return meta, body
+    except Exception as exc:
+        meta["error"] = repr(exc)
+        return meta, b""
 
 
 def dns_probe() -> dict[str, Any]:
@@ -48,30 +85,82 @@ def dns_probe() -> dict[str, Any]:
 
 
 def http_probe() -> dict[str, Any]:
-    result: dict[str, Any] = {"ok": False, "url": "https://www.tiktok.com/"}
-    req = urllib.request.Request(
-        result["url"],
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as response:
-            body = response.read(200_000)
-            result.update(
-                ok=True,
-                status=getattr(response, "status", None),
-                final_url=response.geturl(),
-                bytes_read=len(body),
-                content_type=response.headers.get("content-type"),
-            )
-            (OUT_DIR / "http_home_sample.bin").write_bytes(body)
-    except Exception as exc:
-        result["error"] = repr(exc)
+    result, body = fetch_bytes("https://www.tiktok.com/", limit=200_000)
+    if body:
+        (OUT_DIR / "http_home_sample.bin").write_bytes(body)
+    return result
+
+
+def oembed_probe(video_url: str) -> dict[str, Any]:
+    url = "https://www.tiktok.com/oembed?url=" + urllib.parse.quote(video_url, safe="")
+    meta, body = fetch_bytes(url, limit=500_000)
+    result: dict[str, Any] = {"request": meta}
+    if body:
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+            result["ok"] = True
+            result["data"] = {
+                "title": data.get("title"),
+                "author_name": data.get("author_name"),
+                "author_url": data.get("author_url"),
+                "provider_name": data.get("provider_name"),
+                "thumbnail_url": data.get("thumbnail_url"),
+                "html_chars": len(data.get("html", "")),
+            }
+        except Exception as exc:
+            result["ok"] = False
+            result["decode_error"] = repr(exc)
+            result["body_sample"] = body[:2000].decode("utf-8", errors="replace")
+    else:
+        result["ok"] = False
+    return result
+
+
+def extract_tiktok_urls(text: str) -> list[str]:
+    decoded = urllib.parse.unquote(html_lib.unescape(text.replace("\\u002F", "/")))
+    patterns = [
+        r"https?://(?:www\.)?tiktok\.com/@[A-Za-z0-9._-]+/video/\d+",
+        r"https?://(?:www\.)?tiktok\.com/@[A-Za-z0-9._-]+",
+    ]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, decoded):
+            clean = match.split("?", 1)[0].split("#", 1)[0]
+            if clean not in seen:
+                seen.add(clean)
+                urls.append(clean)
+                if len(urls) >= LIMIT:
+                    return urls
+    return urls
+
+
+def external_search_probe() -> dict[str, Any]:
+    query = f'site:tiktok.com/@ "{QUERY}"'
+    targets = {
+        "bing": "https://www.bing.com/search?q=" + urllib.parse.quote(query),
+        "duckduckgo": "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query),
+    }
+    result: dict[str, Any] = {"query": query, "engines": {}, "video_urls": []}
+    all_urls: list[str] = []
+    seen: set[str] = set()
+    for name, url in targets.items():
+        meta, body = fetch_bytes(url)
+        text = body.decode("utf-8", errors="replace") if body else ""
+        (OUT_DIR / f"search_{name}.html").write_text(text, encoding="utf-8", errors="replace")
+        urls = extract_tiktok_urls(text)
+        for found in urls:
+            if found not in seen:
+                seen.add(found)
+                all_urls.append(found)
+        result["engines"][name] = {
+            **meta,
+            "html_chars": len(text),
+            "tiktok_urls": urls[:20],
+            "tiktok_url_count": len(urls),
+        }
+    result["video_urls"] = [u for u in all_urls if "/video/" in u][:LIMIT]
+    result["all_tiktok_urls"] = all_urls[:LIMIT]
     return result
 
 
@@ -82,8 +171,9 @@ def body_text(page: Page) -> str:
         return ""
 
 
-def classify_page(text: str, url: str) -> dict[str, bool]:
+def classify_page(text: str, url: str, title: str = "") -> dict[str, bool]:
     low = text.lower()
+    title_low = title.lower()
     url_low = url.lower()
     captcha_terms = (
         "captcha",
@@ -92,6 +182,11 @@ def classify_page(text: str, url: str) -> dict[str, bool]:
         "drag the slider",
         "puzzle",
     )
+    login_terms = (
+        "log in to search for popular content",
+        "log in to continue",
+        "login to continue",
+    )
     access_terms = (
         "access denied",
         "too many requests",
@@ -99,7 +194,11 @@ def classify_page(text: str, url: str) -> dict[str, bool]:
     )
     return {
         "captcha": any(term in low for term in captcha_terms),
-        "login_redirect": "/login" in url_low,
+        "login_wall": (
+            any(term in low for term in login_terms)
+            or title_low.startswith("log in")
+            or "/login" in url_low
+        ),
         "access_error": any(term in low for term in access_terms),
     }
 
@@ -117,17 +216,18 @@ def capture(page: Page, label: str) -> dict[str, Any]:
         pass
     text = body_text(page)
     (OUT_DIR / f"{label}.txt").write_text(text, encoding="utf-8", errors="replace")
+    title = ""
+    try:
+        title = page.title()
+    except Exception:
+        pass
     state: dict[str, Any] = {
         "url": page.url,
-        "title": "",
+        "title": title,
         "html_chars": len(html),
         "body_chars": len(text),
     }
-    try:
-        state["title"] = page.title()
-    except Exception:
-        pass
-    state.update(classify_page(text, page.url))
+    state.update(classify_page(text, page.url, title))
     return state
 
 
@@ -195,7 +295,23 @@ def yt_dlp_probe(url: str) -> dict[str, Any]:
     return result
 
 
-def run_browser_probe() -> dict[str, Any]:
+def navigate_and_capture(page: Page, url: str, label: str, wait_seconds: float = 5.0) -> dict[str, Any]:
+    result: dict[str, Any] = {"requested_url": url}
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        time.sleep(wait_seconds)
+        result.update(capture(page, label))
+        result["video_links"] = extract_video_links(page)[:LIMIT]
+    except PlaywrightTimeoutError as exc:
+        result["timeout"] = repr(exc)
+        result.update(capture(page, label + "_timeout"))
+    except Exception as exc:
+        result["error"] = repr(exc)
+        result.update(capture(page, label + "_error"))
+    return result
+
+
+def run_browser_probe(external: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": False,
         "query": QUERY,
@@ -205,89 +321,69 @@ def run_browser_probe() -> dict[str, Any]:
     }
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = p.chromium.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = browser.new_context(
             locale="en-US",
             timezone_id="UTC",
             viewport={"width": 1440, "height": 1000},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            ),
+            user_agent=UA,
         )
         page = context.new_page()
         page.set_default_timeout(20_000)
-
         try:
-            try:
-                page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=60_000)
-                time.sleep(5)
-                result["homepage"] = capture(page, "browser_home")
-            except Exception as exc:
-                result["homepage"] = {"error": repr(exc), "url": page.url}
-                capture(page, "browser_home_error")
+            result["homepage"] = navigate_and_capture(page, "https://www.tiktok.com/", "browser_home", 4)
 
             search_url = "https://www.tiktok.com/search?q=" + urllib.parse.quote(QUERY)
-            result["search_url"] = search_url
-            try:
-                page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
-                time.sleep(8)
-            except PlaywrightTimeoutError as exc:
-                result["search_navigation_timeout"] = repr(exc)
-            except Exception as exc:
-                result["search_navigation_error"] = repr(exc)
-
-            initial_links = extract_video_links(page)
-            observed: list[str] = list(initial_links)
+            search = navigate_and_capture(page, search_url, "browser_search", 7)
+            observed = list(search.get("video_links", []))
             seen = set(observed)
             scroll_counts = [len(observed)]
-
-            for _ in range(6):
-                if len(observed) >= LIMIT:
-                    break
-                try:
+            if not search.get("login_wall"):
+                for _ in range(6):
+                    if len(observed) >= LIMIT:
+                        break
                     page.mouse.wheel(0, 5_000)
-                    time.sleep(2.5)
+                    time.sleep(2.0)
                     for link in extract_video_links(page):
                         if link not in seen:
                             seen.add(link)
                             observed.append(link)
-                            if len(observed) >= LIMIT:
-                                break
                     scroll_counts.append(len(observed))
-                except Exception as exc:
-                    result.setdefault("scroll_errors", []).append(repr(exc))
-                    break
+            search["video_links_after_scroll"] = observed[:LIMIT]
+            search["scroll_counts"] = scroll_counts
+            result["search"] = search
 
-            result["search"] = capture(page, "browser_search")
-            result["initial_video_links"] = len(initial_links)
-            result["video_links_after_scroll"] = len(observed)
-            result["scroll_counts"] = scroll_counts
-            result["video_links"] = observed[:LIMIT]
+            result["known_video_page"] = navigate_and_capture(page, KNOWN_VIDEO, "browser_known_video", 6)
+            result["known_user_page"] = navigate_and_capture(
+                page, f"https://www.tiktok.com/@{KNOWN_USER}", "browser_known_user", 6
+            )
+            result["known_tag_page"] = navigate_and_capture(
+                page, f"https://www.tiktok.com/tag/{KNOWN_TAG}", "browser_known_tag", 6
+            )
 
-            if observed:
-                first_video = observed[0]
-                result["first_video_url"] = first_video
-                try:
-                    page.goto(first_video, wait_until="domcontentloaded", timeout=60_000)
-                    time.sleep(6)
-                    result["first_video_page"] = capture(page, "browser_first_video")
-                except Exception as exc:
-                    result["first_video_page"] = {"error": repr(exc), "url": page.url}
-                    capture(page, "browser_first_video_error")
-                result["yt_dlp"] = yt_dlp_probe(first_video)
+            ext_videos = external.get("video_urls") or []
+            if ext_videos:
+                result["external_video_page"] = navigate_and_capture(
+                    page, ext_videos[0], "browser_external_video", 6
+                )
 
-            flags = result.get("search", {})
-            if observed:
-                result["status"] = "ok"
-                result["ok"] = True
-            elif flags.get("captcha") or flags.get("login_redirect") or flags.get("access_error"):
-                result["status"] = "blocked"
-            else:
-                result["status"] = "empty"
+            result["known_video_yt_dlp"] = yt_dlp_probe(KNOWN_VIDEO)
+
+            candidate_links: list[str] = []
+            for source in (
+                observed,
+                result["known_user_page"].get("video_links", []),
+                result["known_tag_page"].get("video_links", []),
+                ext_videos,
+            ):
+                for url in source:
+                    if "/video/" in url and url not in candidate_links:
+                        candidate_links.append(url)
+            result["candidate_video_links"] = candidate_links[:LIMIT]
+            result["status"] = "ok" if candidate_links else (
+                "search_login_wall" if search.get("login_wall") else "empty"
+            )
+            result["ok"] = bool(candidate_links)
         finally:
             context.close()
             browser.close()
@@ -297,17 +393,21 @@ def run_browser_probe() -> dict[str, Any]:
 
 
 def main() -> int:
+    external = external_search_probe()
     report: dict[str, Any] = {
-        "probe": "tiktok-live-probe-v1",
+        "probe": "tiktok-live-probe-v2",
         "query": QUERY,
+        "known_video": KNOWN_VIDEO,
         "started_at": now_iso(),
         "python": sys.version,
         "platform": sys.platform,
         "dns": dns_probe(),
         "http": http_probe(),
+        "oembed": oembed_probe(KNOWN_VIDEO),
+        "external_search": external,
     }
     try:
-        report["browser"] = run_browser_probe()
+        report["browser"] = run_browser_probe(external)
     except Exception as exc:
         report["browser"] = {"ok": False, "status": "fatal", "error": repr(exc)}
     report["finished_at"] = now_iso()
@@ -317,11 +417,15 @@ def main() -> int:
     summary = {
         "dns_ok": report.get("dns", {}).get("ok"),
         "http_ok": report.get("http", {}).get("ok"),
+        "oembed_ok": report.get("oembed", {}).get("ok"),
+        "external_video_urls": len(external.get("video_urls") or []),
+        "search_login_wall": browser.get("search", {}).get("login_wall"),
+        "known_video_page_login_wall": browser.get("known_video_page", {}).get("login_wall"),
+        "known_user_video_links": len(browser.get("known_user_page", {}).get("video_links") or []),
+        "known_tag_video_links": len(browser.get("known_tag_page", {}).get("video_links") or []),
+        "candidate_video_links": len(browser.get("candidate_video_links") or []),
+        "known_video_yt_dlp_ok": browser.get("known_video_yt_dlp", {}).get("ok"),
         "browser_status": browser.get("status"),
-        "video_links": browser.get("video_links_after_scroll", 0),
-        "captcha": browser.get("search", {}).get("captcha"),
-        "login_redirect": browser.get("search", {}).get("login_redirect"),
-        "yt_dlp_ok": browser.get("yt_dlp", {}).get("ok"),
     }
     dump_json("summary.json", summary)
     print("TIKTOK_PROBE_SUMMARY=" + json.dumps(summary, ensure_ascii=False))
