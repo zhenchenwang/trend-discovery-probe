@@ -6,7 +6,7 @@ on:
       tag:
         description: TikTok hashtag without #
         required: false
-        default: humanoidrobot
+        default: 机器人
       limit:
         description: Candidate limit
         required: false
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
-      PROBE_TAG: ${{ github.event.inputs.tag || 'humanoidrobot' }}
+      PROBE_TAG: ${{ github.event.inputs.tag || '机器人' }}
       PROBE_LIMIT: ${{ github.event.inputs.limit || '150' }}
       PROBE_OUT: discovery_artifacts
       PYTHONUNBUFFERED: '1'
