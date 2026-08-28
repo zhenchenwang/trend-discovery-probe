@@ -1,0 +1,51 @@
+name: TikTok discovery prototype
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: TikTok hashtag without #
+        required: false
+        default: humanoidrobot
+      limit:
+        description: Candidate limit
+        required: false
+        default: '150'
+  push:
+    paths:
+      - 'tests/live/tiktok_discovery_prototype.py'
+      - '.github/workflows/discovery_prototype.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PROBE_TAG: ${{ github.event.inputs.tag || 'humanoidrobot' }}
+      PROBE_LIMIT: ${{ github.event.inputs.limit || '150' }}
+      PROBE_OUT: discovery_artifacts
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Run discovery prototype
+        run: python tests/live/tiktok_discovery_prototype.py
+      - name: Print summary
+        if: always()
+        run: cat discovery_artifacts/discovery_prototype_summary.json 2>/dev/null || true
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-discovery-${{ github.run_id }}
+          path: discovery_artifacts/
+          retention-days: 7
