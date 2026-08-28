@@ -1,0 +1,55 @@
+name: TikTok discovery to download E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: TikTok hashtag without #
+        required: false
+        default: 机器人
+      limit:
+        description: Candidate limit
+        required: false
+        default: '60'
+  push:
+    paths:
+      - 'tests/live/tiktok_e2e_probe.py'
+      - '.github/workflows/e2e_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PROBE_TAG: ${{ github.event.inputs.tag || '机器人' }}
+      PROBE_LIMIT: ${{ github.event.inputs.limit || '60' }}
+      PROBE_DOWNLOAD_COUNT: '2'
+      PROBE_OUT: e2e_artifacts
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Playwright
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Verify ffprobe
+        run: ffprobe -version | head -1
+      - name: Run E2E
+        run: python tests/live/tiktok_e2e_probe.py
+      - name: Print summary
+        if: always()
+        run: cat e2e_artifacts/e2e_summary.json 2>/dev/null || true
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-e2e-${{ github.run_id }}
+          path: |
+            e2e_artifacts/*.json
+          retention-days: 7
