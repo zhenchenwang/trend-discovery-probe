@@ -18,6 +18,7 @@ on:
   push:
     paths:
       - 'tests/live/tiktok_probe_v3.py'
+      - 'tests/live/tiktok_api_probe.py'
       - '.github/workflows/tiktok_probe.yml'
 
 permissions:
@@ -52,11 +53,17 @@ jobs:
       - name: Run TikTok live probe
         run: python tests/live/tiktok_probe_v3.py
 
-      - name: Print summary
+      - name: Run TikTok API probe
+        run: python tests/live/tiktok_api_probe.py
+
+      - name: Print summaries
         if: always()
         run: |
           echo '--- summary.json ---'
           cat probe_artifacts/summary.json 2>/dev/null || true
+          echo
+          echo '--- api_summary.json ---'
+          cat probe_artifacts/api_summary.json 2>/dev/null || true
 
       - name: Upload diagnostic artifact
         if: always()
