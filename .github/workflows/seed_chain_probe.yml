@@ -1,0 +1,48 @@
+name: TikTok seed chain probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: TikTok hashtag without #
+        required: false
+        default: 机器人
+  push:
+    paths:
+      - 'tests/live/tiktok_seed_chain_probe.py'
+      - '.github/workflows/seed_chain_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PROBE_TAG: ${{ github.event.inputs.tag || '机器人' }}
+      PROBE_HASHTAG_LIMIT: '60'
+      PROBE_ACCOUNT_LIMIT: '45'
+      PROBE_OUT: seed_chain_artifacts
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Run seed chain
+        run: python tests/live/tiktok_seed_chain_probe.py
+      - name: Print summary
+        if: always()
+        run: cat seed_chain_artifacts/seed_chain_summary.json 2>/dev/null || true
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-seed-chain-${{ github.run_id }}
+          path: seed_chain_artifacts/
+          retention-days: 7
