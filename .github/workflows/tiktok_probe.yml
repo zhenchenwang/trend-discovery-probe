@@ -19,6 +19,7 @@ on:
     paths:
       - 'tests/live/tiktok_probe_v3.py'
       - 'tests/live/tiktok_api_probe.py'
+      - 'tests/live/tiktok_network_probe.py'
       - '.github/workflows/tiktok_probe.yml'
 
 permissions:
@@ -27,7 +28,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
       PROBE_QUERY: ${{ github.event.inputs.query || 'humanoid robot' }}
       PROBE_TAG: ${{ github.event.inputs.tag || 'humanoidrobot' }}
@@ -56,6 +57,9 @@ jobs:
       - name: Run TikTok API probe
         run: python tests/live/tiktok_api_probe.py
 
+      - name: Run TikTok network probe
+        run: python tests/live/tiktok_network_probe.py
+
       - name: Print summaries
         if: always()
         run: |
@@ -64,6 +68,9 @@ jobs:
           echo
           echo '--- api_summary.json ---'
           cat probe_artifacts/api_summary.json 2>/dev/null || true
+          echo
+          echo '--- network_summary.json ---'
+          cat probe_artifacts/network_summary.json 2>/dev/null || true
 
       - name: Upload diagnostic artifact
         if: always()
