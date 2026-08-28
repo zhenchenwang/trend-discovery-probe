@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import string
 import time
 import urllib.parse
 from collections import OrderedDict
@@ -32,14 +34,14 @@ def item_list(data: Any) -> list[dict[str, Any]]:
     return []
 
 
-def normalize(item: dict[str, Any]) -> dict[str, Any] | None:
+def normalize(item: dict[str, Any], source: str) -> dict[str, Any] | None:
     author = item.get("author") or {}
     stats = item.get("stats") or {}
     if isinstance(author, str):
         author = {"uniqueId": author}
     video_id = str(item.get("id") or item.get("aweme_id") or "").strip()
-    uid = author.get("uniqueId") or author.get("unique_id")
-    if not video_id or not uid:
+    uid = author.get("uniqueId") or author.get("unique_id") or ACCOUNT
+    if not video_id:
         return None
     return {
         "id": video_id,
@@ -48,38 +50,72 @@ def normalize(item: dict[str, Any]) -> dict[str, Any] | None:
         "description": item.get("desc") or item.get("description"),
         "play_count": stats.get("playCount") or stats.get("play_count"),
         "like_count": stats.get("diggCount") or stats.get("digg_count"),
+        "comment_count": stats.get("commentCount") or stats.get("comment_count"),
+        "share_count": stats.get("shareCount") or stats.get("share_count"),
         "create_time": item.get("createTime") or item.get("create_time"),
-        "source": "post_api",
+        "source": source,
     }
 
 
-def safe_prefix(raw: bytes, limit: int = 500) -> str:
+def safe_prefix(raw: bytes, limit: int = 350) -> str:
     return raw[:limit].decode("utf-8", errors="replace").replace("\n", "\\n")
 
 
-def walk_videoish(obj: Any, out: list[dict[str, Any]], depth: int = 0) -> None:
-    if depth > 14:
-        return
-    if isinstance(obj, dict):
-        maybe = normalize(obj)
-        if maybe is not None:
-            maybe["source"] = "hydration"
-            out.append(maybe)
-        for value in obj.values():
-            walk_videoish(value, out, depth + 1)
-    elif isinstance(obj, list):
-        for value in obj[:1000]:
-            walk_videoish(value, out, depth + 1)
+def find_user_detail(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    default_scope = data.get("__DEFAULT_SCOPE__")
+    if isinstance(default_scope, dict):
+        detail = default_scope.get("webapp.user-detail")
+        if isinstance(detail, dict):
+            return detail
+    return {}
+
+
+def creator_query(*, sec_uid: str, cursor: int, device_id: str) -> dict[str, str]:
+    verify_fp = "verify_" + "".join(random.choices(string.hexdigits, k=7))
+    return {
+        "aid": "1988",
+        "app_language": "en",
+        "app_name": "tiktok_web",
+        "browser_language": "en-US",
+        "browser_name": "Mozilla",
+        "browser_online": "true",
+        "browser_platform": "Linux x86_64",
+        "browser_version": "5.0 (X11; Linux x86_64)",
+        "channel": "tiktok_web",
+        "cookie_enabled": "true",
+        "count": "15",
+        "cursor": str(cursor),
+        "device_id": device_id,
+        "device_platform": "web_pc",
+        "focus_state": "true",
+        "from_page": "user",
+        "history_len": "2",
+        "is_fullscreen": "false",
+        "is_page_visible": "true",
+        "language": "en",
+        "os": "linux",
+        "priority_region": "",
+        "referer": "",
+        "region": "US",
+        "screen_height": "1000",
+        "screen_width": "1440",
+        "secUid": sec_uid,
+        "type": "1",
+        "tz_name": "UTC",
+        "verifyFp": verify_fp,
+        "webcast_language": "en",
+    }
 
 
 def run() -> dict[str, Any]:
     candidates: OrderedDict[str, dict[str, Any]] = OrderedDict()
-    pages: list[dict[str, Any]] = []
+    post_api_diagnostics: list[dict[str, Any]] = []
+    creator_pages: list[dict[str, Any]] = []
     errors: list[str] = []
-    response_diagnostics: list[dict[str, Any]] = []
-    hydration_diagnostics: list[dict[str, Any]] = []
     dom_video_urls: list[str] = []
-    script_inventory: list[dict[str, Any]] = []
+    user_detail_summary: dict[str, Any] = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
@@ -95,14 +131,10 @@ def run() -> dict[str, Any]:
         def on_response(response: Response) -> None:
             if "/api/post/item_list/" not in response.url:
                 return
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(response.url).query)
             diag: dict[str, Any] = {
                 "status": response.status,
-                "url": response.url,
-                "cursor": (q.get("cursor") or [None])[0],
                 "content_type": response.headers.get("content-type"),
                 "content_length_header": response.headers.get("content-length"),
-                "content_encoding": response.headers.get("content-encoding"),
             }
             try:
                 raw = response.body()
@@ -110,58 +142,112 @@ def run() -> dict[str, Any]:
                 diag["body_prefix"] = safe_prefix(raw)
             except Exception as exc:
                 diag["body_error"] = repr(exc)
-                raw = b""
-            response_diagnostics.append(diag)
-            if response.status != 200 or not raw:
-                return
-            try:
-                data = json.loads(raw.decode("utf-8-sig"))
-            except Exception as exc:
-                errors.append("post_api_json: " + repr(exc))
-                return
-            rows = item_list(data)
-            before = len(candidates)
-            for raw_item in rows:
-                row = normalize(raw_item)
-                if row and row["id"] not in candidates:
-                    candidates[row["id"]] = row
-            pages.append(
-                {
-                    "cursor_requested": (q.get("cursor") or [None])[0],
-                    "cursor_returned": data.get("cursor"),
-                    "has_more": data.get("hasMore"),
-                    "items_received": len(rows),
-                    "new_items": len(candidates) - before,
-                    "total_unique": len(candidates),
-                }
-            )
+            post_api_diagnostics.append(diag)
 
         page.on("response", on_response)
+        profile_url = f"https://www.tiktok.com/@{urllib.parse.quote(ACCOUNT)}"
         try:
-            page.goto(f"https://www.tiktok.com/@{urllib.parse.quote(ACCOUNT)}", wait_until="domcontentloaded", timeout=60_000)
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
         except Exception as exc:
             errors.append("navigation: " + repr(exc))
         time.sleep(5)
         title = page.title()
 
-        stale = 0
-        last_count = len(candidates)
-        for _ in range(25):
-            if len(candidates) >= LIMIT:
-                break
-            try:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception:
-                page.mouse.wheel(0, 15000)
-            time.sleep(1.8)
-            current = len(candidates)
-            stale = stale + 1 if current <= last_count else 0
-            last_count = current
-            if stale >= 6:
-                break
+        # Extract stable account identifiers from the large hydration object. This
+        # payload is available even when post/item_list is deliberately empty.
+        sec_uid: str | None = None
+        device_id: str | None = None
+        try:
+            hydration_text = page.locator("#__UNIVERSAL_DATA_FOR_REHYDRATION__").text_content() or ""
+            hydration = json.loads(hydration_text) if hydration_text else {}
+            detail = find_user_detail(hydration)
+            user_info = detail.get("userInfo") if isinstance(detail, dict) else {}
+            user = user_info.get("user") if isinstance(user_info, dict) else {}
+            stats = user_info.get("statsV2") or user_info.get("stats") or {} if isinstance(user_info, dict) else {}
+            sec_uid = user.get("secUid") if isinstance(user, dict) else None
+            user_detail_summary = {
+                "statusCode": detail.get("statusCode") if isinstance(detail, dict) else None,
+                "uniqueId": user.get("uniqueId") if isinstance(user, dict) else None,
+                "secUid": sec_uid,
+                "videoCount": stats.get("videoCount") if isinstance(stats, dict) else None,
+                "itemList_count": len(user_info.get("itemList") or []) if isinstance(user_info, dict) else 0,
+            }
+            default_scope = hydration.get("__DEFAULT_SCOPE__") if isinstance(hydration, dict) else {}
+            app_context = default_scope.get("webapp.app-context") if isinstance(default_scope, dict) else {}
+            device_id = str(app_context.get("wid") or "") if isinstance(app_context, dict) else None
+        except Exception as exc:
+            errors.append("hydration: " + repr(exc))
 
-        # DOM fallback: public profile pages often expose canonical video anchors even
-        # when post/item_list returns an empty anti-bot response.
+        # TikTok's current profile webpage calls post/item_list but on public cloud
+        # runners it can return HTTP 200 with Content-Length: 0. The current yt-dlp
+        # extractor instead uses /api/creator/item_list/ with secUid and a timestamp
+        # cursor. Test that route directly in the same browser context/session.
+        if sec_uid:
+            if not device_id:
+                device_id = str(random.randint(10**18, 10**19 - 1))
+            cursor = int(time.time() * 1000)
+            seen_batches: set[tuple[str, ...]] = set()
+            for page_number in range(1, 9):
+                if len(candidates) >= LIMIT:
+                    break
+                query = creator_query(sec_uid=sec_uid, cursor=cursor, device_id=device_id)
+                try:
+                    response = context.request.get(
+                        "https://www.tiktok.com/api/creator/item_list/",
+                        params=query,
+                        headers={"Referer": profile_url, "User-Agent": UA, "Accept": "application/json"},
+                        timeout=30_000,
+                    )
+                    raw = response.body()
+                    diag: dict[str, Any] = {
+                        "page": page_number,
+                        "cursor_requested": cursor,
+                        "status": response.status,
+                        "content_type": response.headers.get("content-type"),
+                        "content_length_header": response.headers.get("content-length"),
+                        "body_bytes": len(raw),
+                        "body_prefix": safe_prefix(raw),
+                    }
+                    if not raw:
+                        creator_pages.append(diag)
+                        break
+                    data = json.loads(raw.decode("utf-8-sig"))
+                    rows = item_list(data)
+                    ids = tuple(sorted(str(x.get("id") or x.get("aweme_id") or "") for x in rows if isinstance(x, dict)))
+                    if ids and ids in seen_batches:
+                        diag["repeated_batch"] = True
+                        creator_pages.append(diag)
+                        break
+                    if ids:
+                        seen_batches.add(ids)
+                    before = len(candidates)
+                    for raw_item in rows:
+                        row = normalize(raw_item, "creator_api")
+                        if row and row["id"] not in candidates:
+                            candidates[row["id"]] = row
+                    diag.update(
+                        {
+                            "items_received": len(rows),
+                            "new_items": len(candidates) - before,
+                            "total_unique": len(candidates),
+                            "hasMorePrevious": data.get("hasMorePrevious"),
+                        }
+                    )
+                    creator_pages.append(diag)
+                    old_cursor = cursor
+                    if rows:
+                        last_time = rows[-1].get("createTime") or rows[-1].get("create_time")
+                        if last_time:
+                            cursor = int(float(last_time) * 1000)
+                    if cursor == old_cursor:
+                        cursor = old_cursor - 7 * 86_400_000
+                    if not data.get("hasMorePrevious"):
+                        break
+                except Exception as exc:
+                    errors.append(f"creator_api_page_{page_number}: {exc!r}")
+                    break
+
+        # Last-resort DOM anchors for environments where TikTok actually renders the grid.
         try:
             hrefs = page.locator('a[href*="/video/"]').evaluate_all(
                 "els => els.map(e => e.href || e.getAttribute('href')).filter(Boolean)"
@@ -187,49 +273,11 @@ def run() -> dict[str, Any]:
                     "description": None,
                     "play_count": None,
                     "like_count": None,
+                    "comment_count": None,
+                    "share_count": None,
                     "create_time": None,
                     "source": "dom_anchor",
                 }
-
-        # Inspect JSON script payloads. Keep only compact diagnostics in the report,
-        # but recursively look for item-like objects that already contain stats.
-        try:
-            scripts = page.locator("script").evaluate_all(
-                "els => els.map(e => ({id:e.id||'', type:e.type||'', text:(e.textContent||'')}))"
-            )
-        except Exception as exc:
-            errors.append("scripts: " + repr(exc))
-            scripts = []
-        hydration_rows: list[dict[str, Any]] = []
-        for script in scripts:
-            text = script.get("text") or ""
-            sid = script.get("id") or ""
-            stype = script.get("type") or ""
-            script_inventory.append({
-                "id": sid,
-                "type": stype,
-                "length": len(text),
-                "prefix": text[:120].replace("\n", "\\n"),
-            })
-            if not text or text[0] not in "[{":
-                continue
-            try:
-                data = json.loads(text)
-            except Exception:
-                continue
-            before = len(hydration_rows)
-            walk_videoish(data, hydration_rows)
-            if len(hydration_rows) > before:
-                hydration_diagnostics.append(
-                    {"id": sid, "type": stype, "length": len(text), "videoish_found": len(hydration_rows) - before}
-                )
-        for row in hydration_rows:
-            if row["id"] not in candidates:
-                candidates[row["id"]] = row
-            else:
-                existing = candidates[row["id"]]
-                if existing.get("play_count") is None and row.get("play_count") is not None:
-                    candidates[row["id"]] = row
 
         final_url = page.url
         context.close()
@@ -241,18 +289,16 @@ def run() -> dict[str, Any]:
         source = str(row.get("source") or "unknown")
         source_counts[source] = source_counts.get(source, 0) + 1
     return {
-        "probe_version": 2,
+        "probe_version": 3,
         "account": ACCOUNT,
         "title": title,
         "final_url": final_url,
+        "user_detail": user_detail_summary,
         "candidate_count": len(rows),
         "candidate_source_counts": source_counts,
-        "pages": pages,
-        "response_diagnostics": response_diagnostics[:12],
+        "post_api_diagnostics": post_api_diagnostics[:6],
+        "creator_pages": creator_pages,
         "dom_video_url_count": len(dom_video_urls),
-        "dom_video_urls": dom_video_urls[:20],
-        "hydration_diagnostics": hydration_diagnostics[:20],
-        "script_inventory": script_inventory[:30],
         "errors": errors,
         "top_videos": sorted(rows, key=lambda x: x.get("play_count") or 0, reverse=True)[:8],
     }
@@ -261,7 +307,7 @@ def run() -> dict[str, Any]:
 def main() -> int:
     report = run()
     (OUT / "account_probe.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("TIKTOK_ACCOUNT_PROBE_V2=" + json.dumps(report, ensure_ascii=False))
+    print("TIKTOK_ACCOUNT_PROBE_V3=" + json.dumps(report, ensure_ascii=False))
     return 0 if report["candidate_count"] > 0 else 2
 
 
