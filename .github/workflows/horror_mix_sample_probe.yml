@@ -1,0 +1,47 @@
+name: Multilingual Horror Mix Sample
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tests/live/horror_mix_sample_probe.py'
+      - '.github/workflows/horror_mix_sample_probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  horror-sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      PROBE_ROOT: artifacts/horror_mix_sample
+      PROBE_MINIMUM: '30'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install media and browser dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install 'playwright>=1.50' 'edge-tts>=7.2,<8'
+          python -m playwright install --with-deps chromium
+      - name: Build horror Mix sample
+        run: python tests/live/horror_mix_sample_probe.py
+      - name: Print summary
+        if: always()
+        run: cat artifacts/horror_mix_sample/summary.json 2>/dev/null || true
+      - name: Upload horror sample
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horror-mix-sample-${{ github.run_id }}
+          path: |
+            artifacts/horror_mix_sample/summary.json
+            artifacts/horror_mix_sample/horror_mix_sample.mp4
+            artifacts/horror_mix_sample/comment_1.mp3
+            artifacts/horror_mix_sample/comment_2.mp3
+          retention-days: 7
