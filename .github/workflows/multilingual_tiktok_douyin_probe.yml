@@ -1,0 +1,32 @@
+name: Multilingual TikTok + Douyin probe
+
+on:
+  push:
+    paths:
+      - 'tests/live/multilingual_tiktok_douyin_probe.py'
+      - '.github/workflows/multilingual_tiktok_douyin_probe.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+      - name: Run live multilingual probe
+        run: python tests/live/multilingual_tiktok_douyin_probe.py
+      - name: Upload probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multilingual-tiktok-douyin-${{ github.run_id }}
+          path: probe-output/
+          if-no-files-found: warn
