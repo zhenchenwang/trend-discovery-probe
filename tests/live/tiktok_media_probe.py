@@ -52,12 +52,26 @@ def hydration_video_urls(page) -> list[str]:
     return found[:20]
 
 
+def looks_like_video_response(response: Response) -> bool:
+    ct = (response.headers.get("content-type") or "").lower()
+    url = response.url.lower()
+    return (
+        ct.startswith("video/")
+        or "mime_type=video_mp4" in url
+        or "mime_type=video" in url
+        or "webapp-prime" in url and "/video/" in url
+    )
+
+
 def run() -> dict[str, Any]:
-    report: dict[str, Any] = {"probe": "tiktok-media-probe-v1", "started_at": now_iso(), "video": KNOWN_VIDEO}
+    report: dict[str, Any] = {"probe": "tiktok-media-probe-v2", "started_at": now_iso(), "video": KNOWN_VIDEO}
     media_responses: list[dict[str, Any]] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"],
+        )
         context = browser.new_context(
             locale="en-US",
             timezone_id="UTC",
@@ -68,20 +82,19 @@ def run() -> dict[str, Any]:
         page.set_default_timeout(20000)
 
         def on_response(response: Response) -> None:
-            ct = (response.headers.get("content-type") or "").lower()
-            url_low = response.url.lower()
-            if "video/" in ct or "mime_type=video" in url_low or "tiktokcdn" in url_low or "webapp-prime" in url_low:
-                media_responses.append({
-                    "url": response.url,
-                    "status": response.status,
-                    "content_type": ct,
-                    "content_length": response.headers.get("content-length"),
-                    "content_range": response.headers.get("content-range"),
-                    "request_headers": {
-                        k: v for k, v in response.request.headers.items()
-                        if k.lower() in {"referer", "origin", "range", "user-agent", "accept"}
-                    },
-                })
+            if not looks_like_video_response(response):
+                return
+            media_responses.append({
+                "url": response.url,
+                "status": response.status,
+                "content_type": response.headers.get("content-type"),
+                "content_length": response.headers.get("content-length"),
+                "content_range": response.headers.get("content-range"),
+                "request_headers": {
+                    k: v for k, v in response.request.headers.items()
+                    if k.lower() in {"referer", "origin", "range", "user-agent", "accept"}
+                },
+            })
 
         page.on("response", on_response)
         try:
@@ -90,8 +103,8 @@ def run() -> dict[str, Any]:
             report["navigation_error"] = repr(exc)
         time.sleep(5)
         report["title"] = page.title()
-        urls = hydration_video_urls(page)
-        report["hydration_media_urls"] = urls
+        hydration_urls = hydration_video_urls(page)
+        report["hydration_media_urls"] = hydration_urls
 
         try:
             page.locator("video").first.evaluate("v => { v.muted = true; v.play().catch(()=>{}); }")
@@ -100,18 +113,21 @@ def run() -> dict[str, Any]:
         time.sleep(8)
         report["observed_media_responses"] = media_responses[:20]
 
-        # Try the browser context's authenticated request client against the signed URL.
+        # Hydration gives us TikTok's signed public media URLs. Try those first,
+        # then any video responses actually seen by Chromium. The browser context
+        # carries the same cookies/session state as the page.
         targets: list[str] = []
-        for row in media_responses:
-            if row.get("url") not in targets:
-                targets.append(row["url"])
-        for url in urls:
+        for url in hydration_urls:
             if url not in targets:
+                targets.append(url)
+        for row in media_responses:
+            url = row.get("url")
+            if isinstance(url, str) and url not in targets:
                 targets.append(url)
 
         attempts: list[dict[str, Any]] = []
-        for index, target in enumerate(targets[:3]):
-            result: dict[str, Any] = {"url": target}
+        for index, target in enumerate(targets[:6]):
+            result: dict[str, Any] = {"url": target, "source": "hydration" if target in hydration_urls else "browser_network"}
             try:
                 response = context.request.get(
                     target,
@@ -119,28 +135,30 @@ def run() -> dict[str, Any]:
                         "Referer": KNOWN_VIDEO,
                         "User-Agent": UA,
                         "Range": "bytes=0-1048575",
-                        "Accept": "*/*",
+                        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
                     },
                     timeout=30000,
                     fail_on_status_code=False,
                 )
+                body = response.body()
                 result.update({
                     "status": response.status,
                     "ok": response.ok,
                     "content_type": response.headers.get("content-type"),
                     "content_length": response.headers.get("content-length"),
                     "content_range": response.headers.get("content-range"),
+                    "bytes": len(body),
+                    "magic_hex": body[:16].hex(),
+                    "has_ftyp": b"ftyp" in body[:64],
                 })
-                body = response.body()
-                result["bytes"] = len(body)
                 if response.status in (200, 206) and body:
-                    (OUT_DIR / f"media_sample_{index}.bin").write_bytes(body[:2_000_000])
-                    result["saved"] = f"media_sample_{index}.bin"
+                    filename = f"media_sample_{index}.bin"
+                    (OUT_DIR / filename).write_bytes(body[:2_000_000])
+                    result["saved"] = filename
             except Exception as exc:
                 result["error"] = repr(exc)
             attempts.append(result)
         report["context_request_attempts"] = attempts
-
         report["cookies_count"] = len(context.cookies())
         context.close()
         browser.close()
@@ -157,7 +175,10 @@ def main() -> int:
         "hydration_media_urls": len(report.get("hydration_media_urls") or []),
         "observed_media_responses": len(report.get("observed_media_responses") or []),
         "attempts": [
-            {k: row.get(k) for k in ("status", "ok", "content_type", "content_length", "content_range", "bytes", "saved", "error")}
+            {k: row.get(k) for k in (
+                "source", "status", "ok", "content_type", "content_length", "content_range",
+                "bytes", "has_ftyp", "saved", "error"
+            )}
             for row in report.get("context_request_attempts", [])
         ],
         "cookies_count": report.get("cookies_count"),
